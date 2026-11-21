@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0]
+
+### Added
+
+- `blocking` feature (default) providing `Store`, which implements `WalletPersister`.
+- `async` feature providing `AsyncStore`, which implements `AsyncWalletPersister` on a dedicated worker thread.
+  The `blocking` and `async` features can be enabled at the same time.
+- `bundled` feature (default) to compile SQLite from source instead of linking the system library.
+- A `schema_migrations` table records applied migrations.
+  Databases created by earlier sqlx-based releases are imported once, read-only, from `_sqlx_migrations`, so existing wallets are never re-migrated.
+
+### Changed
+
+- Replace `sqlx` with [`sqlite-thin`](https://github.com/thesimplekid/cdk/tree/main/crates/sqlite-thin).
+  The dependency is pinned to a git revision until `sqlite-thin` is published to crates.io.
+- `Store::new`, `Store::new_memory`, `Store::migrate`, `Store::write_changeset`, and `Store::read_changeset` are now blocking.
+- The associated read and write methods accept `&sqlite_thin::Connection` instead of `&mut sqlx::SqliteConnection`.
+- `Store::new` accepts a plain path; `sqlite://` URLs are translated for compatibility.
+
+### Removed
+
+- The `sqlx` dependency and all `sqlx` types from the public API.
+- `Store::new_pool`; use `Store::from_connection` or `AsyncStore::from_connection`.
+- `Clone` for `Store`, which now owns a single SQLite connection.
+
 ## [0.6.0]
 
 ### Added
@@ -66,7 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - feat: Make `Store::migrate` public
 - deps: Bump `bdk_wallet` to 2.3.0
 
-[unreleased]: https://github.com/bitcoindevkit/bdk-sqlite/compare/0.6.0...HEAD
+[unreleased]: https://github.com/bitcoindevkit/bdk-sqlite/compare/0.7.0...HEAD
+[0.7.0]: https://github.com/bitcoindevkit/bdk-sqlite/releases/tag/0.7.0
 [0.6.0]: https://github.com/bitcoindevkit/bdk-sqlite/releases/tag/0.6.0
 [0.5.0]: https://github.com/bitcoindevkit/bdk-sqlite/releases/tag/0.5.0
 [0.4.3]: https://github.com/bitcoindevkit/bdk-sqlite/releases/tag/0.4.3
