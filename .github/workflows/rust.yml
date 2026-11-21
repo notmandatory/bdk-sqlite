@@ -24,14 +24,27 @@ jobs:
       with:
         toolchain: ${{ matrix.toolchain }}
         cache: true
+    - name: Ensure sqlx is removed
+      run: |
+        if grep -rn -E 'sqlx::|use sqlx|sqlx *=' src examples README.md Cargo.toml; then
+          echo "sqlx references found" >&2
+          exit 1
+        fi
     - name: Check features
       run: |
         cargo check --no-default-features
         cargo check --no-default-features --features wallet
+        cargo check --no-default-features --features blocking,bundled
+        cargo check --no-default-features --features async,bundled
+        cargo check --no-default-features --features blocking,async,bundled
+        cargo check --no-default-features --features blocking,wallet,bundled
+        cargo check --no-default-features --features async,wallet,bundled
     - name: Build
       run: cargo build
     - name: Test
       run: cargo test --no-fail-fast
+    - name: Test all features
+      run: cargo test --all-features --no-fail-fast
 
   lint:
     name: Lint
