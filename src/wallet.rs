@@ -12,7 +12,7 @@ use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
 use sqlite_thin::{Connection, OptionalExtension, params};
 
 use crate::db;
-use crate::error::Error;
+use crate::error::InternalError as Error;
 
 /// Write changeset.
 pub(crate) fn write_changeset(conn: &Connection, changeset: &ChangeSet) -> Result<(), Error> {

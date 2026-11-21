@@ -25,11 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Store::new`, `Store::new_memory`, `Store::migrate`, `Store::write_changeset`, and `Store::read_changeset` are now blocking.
 - The associated read and write methods accept `&sqlite_thin::Connection` instead of `&mut sqlx::SqliteConnection`.
 - `Store::new` accepts a plain path; `sqlite://` URLs are translated for compatibility.
+- Backend types are not part of the public API. Database failures surface as `Error::Database(DatabaseError)`, whose inner error is opaque.
 
 ### Removed
 
 - The `sqlx` dependency and all `sqlx` types from the public API.
-- `Store::new_pool`; use `Store::from_connection` or `AsyncStore::from_connection`.
+- `Store::new_pool`; open a database with `Store::new`, `Store::new_memory`, `AsyncStore::new`, or `AsyncStore::new_memory`.
 - `Clone` for `Store`, which now owns a single SQLite connection.
 
 ## [0.6.0]

@@ -15,7 +15,7 @@ use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
 use sqlite_thin::Connection;
 
 use crate::db;
-use crate::error::Error;
+use crate::error::{Error, InternalError, database};
 #[cfg(feature = "wallet")]
 use crate::wallet;
 
@@ -37,72 +37,62 @@ impl Store {
     /// a sqlx-style URL such as `sqlite://foo.db`. `:memory:` and
     /// `sqlite::memory:` create an in-memory database.
     pub fn new(path: &str) -> Result<Self, Error> {
-        let conn = db::open(path)?;
+        let conn = db::open(path).map_err(InternalError::into_public)?;
         Ok(Self { conn })
     }
 
     /// New in memory.
     pub fn new_memory() -> Result<Self, Error> {
-        let conn = Connection::open_in_memory()?;
+        let conn = Connection::open_in_memory().map_err(database)?;
         Ok(Self { conn })
-    }
-
-    /// Create a new [`Store`] from an existing [`Connection`].
-    pub fn from_connection(conn: Connection) -> Self {
-        Self { conn }
-    }
-
-    /// The underlying SQLite connection.
-    pub fn connection(&self) -> &Connection {
-        &self.conn
     }
 
     /// Runs pending migrations against the database.
     pub fn migrate(&self) -> Result<(), Error> {
-        crate::migrate::migrate(&self.conn)
+        crate::migrate::migrate(&self.conn).map_err(InternalError::into_public)
     }
-}
 
-impl Store {
     /// Write tx_graph.
     pub fn write_tx_graph(
-        conn: &Connection,
+        &self,
         tx_graph: &tx_graph::ChangeSet<ConfirmationBlockTime>,
     ) -> Result<(), Error> {
-        db::write_tx_graph(conn, tx_graph)
+        self.with_transaction(|conn| db::write_tx_graph(conn, tx_graph))
     }
 
     /// Write local_chain.
-    pub fn write_local_chain(
-        conn: &Connection,
-        local_chain: &local_chain::ChangeSet,
-    ) -> Result<(), Error> {
-        db::write_local_chain(conn, local_chain)
+    pub fn write_local_chain(&self, local_chain: &local_chain::ChangeSet) -> Result<(), Error> {
+        self.with_transaction(|conn| db::write_local_chain(conn, local_chain))
     }
 
     /// Write keychain_txout.
     pub fn write_keychain_txout(
-        conn: &Connection,
+        &self,
         keychain_txout: &keychain_txout::ChangeSet,
     ) -> Result<(), Error> {
-        db::write_keychain_txout(conn, keychain_txout)
+        self.with_transaction(|conn| db::write_keychain_txout(conn, keychain_txout))
     }
 
     /// Read tx_graph.
-    pub fn read_tx_graph(
-        conn: &Connection,
-    ) -> Result<tx_graph::ChangeSet<ConfirmationBlockTime>, Error> {
-        db::read_tx_graph(conn)
+    pub fn read_tx_graph(&self) -> Result<tx_graph::ChangeSet<ConfirmationBlockTime>, Error> {
+        db::read_tx_graph(&self.conn).map_err(InternalError::into_public)
     }
 
     /// Read local_chain.
-    pub fn read_local_chain(conn: &Connection) -> Result<local_chain::ChangeSet, Error> {
-        db::read_local_chain(conn)
+    pub fn read_local_chain(&self) -> Result<local_chain::ChangeSet, Error> {
+        db::read_local_chain(&self.conn).map_err(InternalError::into_public)
     }
 
     /// Read keychain_txout.
-    pub fn read_keychain_txout(conn: &Connection) -> Result<keychain_txout::ChangeSet, Error> {
-        db::read_keychain_txout(conn)
+    pub fn read_keychain_txout(&self) -> Result<keychain_txout::ChangeSet, Error> {
+        db::read_keychain_txout(&self.conn).map_err(InternalError::into_public)
+    }
+
+    fn with_transaction<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, InternalError>,
+    ) -> Result<T, Error> {
+        db::with_transaction(&self.conn, f).map_err(InternalError::into_public)
     }
 }
 
@@ -110,50 +100,50 @@ impl Store {
 impl Store {
     /// Write changeset.
     pub fn write_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
-        wallet::write_changeset(&self.conn, changeset)
+        wallet::write_changeset(&self.conn, changeset).map_err(InternalError::into_public)
     }
 
     /// Write network.
-    pub fn write_network(conn: &Connection, network: Network) -> Result<(), Error> {
-        wallet::write_network(conn, network)
+    pub fn write_network(&self, network: Network) -> Result<(), Error> {
+        self.with_transaction(|conn| wallet::write_network(conn, network))
     }
 
     /// Write keychain descriptors.
     pub fn write_keychain_descriptors(
-        conn: &Connection,
+        &self,
         descriptors: &BTreeMap<KeychainKind, Descriptor<DescriptorPublicKey>>,
     ) -> Result<(), Error> {
-        wallet::write_keychain_descriptors(conn, descriptors)
+        self.with_transaction(|conn| wallet::write_keychain_descriptors(conn, descriptors))
     }
 
     /// Read changeset.
     pub fn read_changeset(&self) -> Result<ChangeSet, Error> {
-        wallet::read_changeset(&self.conn)
+        wallet::read_changeset(&self.conn).map_err(InternalError::into_public)
     }
 
     /// Read network.
-    pub fn read_network(conn: &Connection) -> Result<Option<Network>, Error> {
-        wallet::read_network(conn)
+    pub fn read_network(&self) -> Result<Option<Network>, Error> {
+        wallet::read_network(&self.conn).map_err(InternalError::into_public)
     }
 
     /// Read keychain descriptors.
     pub fn read_keychain_descriptors(
-        conn: &Connection,
+        &self,
     ) -> Result<BTreeMap<KeychainKind, Descriptor<DescriptorPublicKey>>, Error> {
-        wallet::read_keychain_descriptors(conn)
+        wallet::read_keychain_descriptors(&self.conn).map_err(InternalError::into_public)
     }
 
     /// Write locked outpoints.
     pub fn write_locked_outpoints(
-        conn: &Connection,
+        &self,
         locked_outpoints: &locked_outpoints::ChangeSet,
     ) -> Result<(), Error> {
-        wallet::write_locked_outpoints(conn, locked_outpoints)
+        self.with_transaction(|conn| wallet::write_locked_outpoints(conn, locked_outpoints))
     }
 
     /// Read locked outpoints.
-    pub fn read_locked_outpoints(conn: &Connection) -> Result<locked_outpoints::ChangeSet, Error> {
-        wallet::read_locked_outpoints(conn)
+    pub fn read_locked_outpoints(&self) -> Result<locked_outpoints::ChangeSet, Error> {
+        wallet::read_locked_outpoints(&self.conn).map_err(InternalError::into_public)
     }
 }
 
@@ -186,25 +176,15 @@ mod test {
 
         let store = Store::new_memory()?;
         store.migrate()?;
-
-        {
-            let txn = store.connection().unchecked_transaction()?;
-            Store::write_local_chain(&txn, &cs).expect("failed to write `local_chain`");
-            txn.commit()?;
-        }
+        store.write_local_chain(&cs)?;
 
         // Trying to replace the value of existing height should be ignored.
         cs.blocks.insert(1, Some(Hash::hash(b"1a")));
-
-        {
-            let txn = store.connection().unchecked_transaction()?;
-            Store::write_local_chain(&txn, &cs).expect("failed to write `local_chain`");
-            txn.commit()?;
-        }
+        store.write_local_chain(&cs)?;
 
         let rows = {
             let mut stmt = store
-                .connection()
+                .conn
                 .prepare("SELECT height, hash FROM block WHERE height = 1")?;
             let mut rows = stmt.query([])?;
             let mut rows_out: Vec<(u32, String)> = Vec::new();
@@ -221,24 +201,14 @@ mod test {
         // Delete row 1 and insert hash "1a" again.
         let mut cs = local_chain::ChangeSet::default();
         cs.blocks.insert(1, None);
-
-        {
-            let txn = store.connection().unchecked_transaction()?;
-            Store::write_local_chain(&txn, &cs).expect("failed to write `local_chain`");
-            txn.commit()?;
-        }
+        store.write_local_chain(&cs)?;
 
         cs.blocks.insert(1, Some(Hash::hash(b"1a")));
-
-        {
-            let txn = store.connection().unchecked_transaction()?;
-            Store::write_local_chain(&txn, &cs).expect("failed to write `local_chain`");
-            txn.commit()?;
-        }
+        store.write_local_chain(&cs)?;
 
         let rows = {
             let mut stmt = store
-                .connection()
+                .conn
                 .prepare("SELECT height, hash FROM block WHERE height = 1")?;
             let mut rows = stmt.query([])?;
             let mut rows_out: Vec<(u32, String)> = Vec::new();

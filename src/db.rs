@@ -8,7 +8,7 @@ use bdk_chain::{
 use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid, consensus};
 use sqlite_thin::{Connection, params};
 
-use crate::error::Error;
+use crate::error::InternalError as Error;
 
 /// Opens a database connection from a path or a sqlx-style URL.
 pub(crate) fn open(path: &str) -> Result<Connection, Error> {
@@ -18,6 +18,17 @@ pub(crate) fn open(path: &str) -> Result<Connection, Error> {
         path => Connection::open(path)?,
     };
     Ok(conn)
+}
+
+/// Runs `f` inside a transaction.
+pub(crate) fn with_transaction<T>(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let txn = conn.unchecked_transaction()?;
+    let value = f(&txn)?;
+    txn.commit()?;
+    Ok(value)
 }
 
 /// Write tx_graph.

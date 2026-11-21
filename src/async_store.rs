@@ -24,7 +24,7 @@ use futures_channel::oneshot;
 use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
 use sqlite_thin::Connection;
 
-use crate::error::Error;
+use crate::error::{Error, InternalError, database};
 #[cfg(feature = "wallet")]
 use crate::wallet;
 use crate::{db, migrate};
@@ -75,20 +75,17 @@ impl AsyncStore {
     /// This will create a new database at the given path if it doesn't exist.
     /// See the blocking `Store::new` for the accepted path formats.
     pub async fn new(path: &str) -> Result<Self, Error> {
-        let conn = db::open(path)?;
-        Self::from_connection(conn)
+        let conn = db::open(path).map_err(InternalError::into_public)?;
+        Self::spawn(conn)
     }
 
     /// New in memory.
     pub async fn new_memory() -> Result<Self, Error> {
-        let conn = Connection::open_in_memory()?;
-        Self::from_connection(conn)
+        let conn = Connection::open_in_memory().map_err(database)?;
+        Self::spawn(conn)
     }
 
-    /// Create a new [`AsyncStore`] from an existing [`Connection`].
-    ///
-    /// The connection is moved to the worker thread.
-    pub fn from_connection(conn: Connection) -> Result<Self, Error> {
+    fn spawn(conn: Connection) -> Result<Self, Error> {
         let (tx, rx) = mpsc::channel();
         thread::Builder::new()
             .name("bdk-sqlite".to_string())
@@ -216,61 +213,77 @@ impl AsyncStore {
     }
 }
 
+fn public<T>(result: Result<T, InternalError>) -> Result<T, Error> {
+    result.map_err(InternalError::into_public)
+}
+
 fn run(conn: Connection, rx: Receiver<Command>) {
     while let Ok(command) = rx.recv() {
         match command {
             Command::Migrate(reply) => {
-                let _ = reply.send(migrate::migrate(&conn));
+                let _ = reply.send(public(migrate::migrate(&conn)));
             }
             Command::ReadTxGraph(reply) => {
-                let _ = reply.send(db::read_tx_graph(&conn));
+                let _ = reply.send(public(db::read_tx_graph(&conn)));
             }
             Command::WriteTxGraph(changeset, reply) => {
-                let _ = reply.send(db::write_tx_graph(&conn, &changeset));
+                let _ = reply.send(public(db::with_transaction(&conn, |conn| {
+                    db::write_tx_graph(conn, &changeset)
+                })));
             }
             Command::ReadLocalChain(reply) => {
-                let _ = reply.send(db::read_local_chain(&conn));
+                let _ = reply.send(public(db::read_local_chain(&conn)));
             }
             Command::WriteLocalChain(changeset, reply) => {
-                let _ = reply.send(db::write_local_chain(&conn, &changeset));
+                let _ = reply.send(public(db::with_transaction(&conn, |conn| {
+                    db::write_local_chain(conn, &changeset)
+                })));
             }
             Command::ReadKeychainTxout(reply) => {
-                let _ = reply.send(db::read_keychain_txout(&conn));
+                let _ = reply.send(public(db::read_keychain_txout(&conn)));
             }
             Command::WriteKeychainTxout(changeset, reply) => {
-                let _ = reply.send(db::write_keychain_txout(&conn, &changeset));
+                let _ = reply.send(public(db::with_transaction(&conn, |conn| {
+                    db::write_keychain_txout(conn, &changeset)
+                })));
             }
             #[cfg(feature = "wallet")]
             Command::ReadChangeset(reply) => {
-                let _ = reply.send(wallet::read_changeset(&conn));
+                let _ = reply.send(public(wallet::read_changeset(&conn)));
             }
             #[cfg(feature = "wallet")]
             Command::WriteChangeset(changeset, reply) => {
-                let _ = reply.send(wallet::write_changeset(&conn, &changeset));
+                let _ = reply.send(public(wallet::write_changeset(&conn, &changeset)));
             }
             #[cfg(feature = "wallet")]
             Command::ReadNetwork(reply) => {
-                let _ = reply.send(wallet::read_network(&conn));
+                let _ = reply.send(public(wallet::read_network(&conn)));
             }
             #[cfg(feature = "wallet")]
             Command::WriteNetwork(network, reply) => {
-                let _ = reply.send(wallet::write_network(&conn, network));
+                let _ = reply.send(public(db::with_transaction(&conn, |conn| {
+                    wallet::write_network(conn, network)
+                })));
             }
             #[cfg(feature = "wallet")]
             Command::ReadKeychainDescriptors(reply) => {
-                let _ = reply.send(wallet::read_keychain_descriptors(&conn));
+                let _ = reply.send(public(wallet::read_keychain_descriptors(&conn)));
             }
             #[cfg(feature = "wallet")]
             Command::WriteKeychainDescriptors(descriptors, reply) => {
-                let _ = reply.send(wallet::write_keychain_descriptors(&conn, &descriptors));
+                let _ = reply.send(public(db::with_transaction(&conn, |conn| {
+                    wallet::write_keychain_descriptors(conn, &descriptors)
+                })));
             }
             #[cfg(feature = "wallet")]
             Command::ReadLockedOutpoints(reply) => {
-                let _ = reply.send(wallet::read_locked_outpoints(&conn));
+                let _ = reply.send(public(wallet::read_locked_outpoints(&conn)));
             }
             #[cfg(feature = "wallet")]
             Command::WriteLockedOutpoints(locked_outpoints, reply) => {
-                let _ = reply.send(wallet::write_locked_outpoints(&conn, &locked_outpoints));
+                let _ = reply.send(public(db::with_transaction(&conn, |conn| {
+                    wallet::write_locked_outpoints(conn, &locked_outpoints)
+                })));
             }
         }
     }

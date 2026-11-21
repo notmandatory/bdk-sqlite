@@ -8,7 +8,7 @@
 use sha2::{Digest, Sha384};
 use sqlite_thin::{Connection, OptionalExtension, params};
 
-use crate::error::{Error, MigrateError};
+use crate::error::{InternalError as Error, MigrateError};
 
 /// Migrations in version order: `(version, description, sql)`.
 const MIGRATIONS: &[(i64, &str, &str)] = &[
