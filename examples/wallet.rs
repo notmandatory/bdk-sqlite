@@ -5,11 +5,9 @@ use std::io::Write;
 
 use bdk_esplora::EsploraAsyncExt;
 use bdk_esplora::esplora_client;
-use bdk_sqlite::Store;
+use bdk_sqlite::AsyncStore;
 use bdk_wallet::bitcoin;
 use bdk_wallet::{KeychainKind, Wallet};
-
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 const DB_PATH: &str = "test.db";
 const NETWORK: bitcoin::Network = bitcoin::Network::Testnet4;
@@ -21,20 +19,11 @@ const PARALLEL_REQUESTS: usize = 1;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Get a new in memory `Store` for testing.
-    // let mut db = Store::new_memory().await?;
+    // Create an in memory `AsyncStore` for testing.
+    // let mut db = AsyncStore::new_memory().await?;
 
-    // Configure the options yourself and connect lazily when creating a `Store`.
-    let mut options = SqliteConnectOptions::new();
-    options = options.filename(DB_PATH);
-    options = options.create_if_missing(true);
-    let mut pool = SqlitePoolOptions::new()
-        .max_connections(10)
-        .connect_lazy_with(options);
-    let mut db = Store::new_pool(pool).await?;
-
-    // Or connect to the database straight away.
-    // let mut db = Store::new(DB_PATH).await?;
+    // Or connect to a database on disk, creating it if it doesn't exist.
+    let mut db = AsyncStore::new(DB_PATH).await?;
 
     let mut wallet = match Wallet::load().load_wallet_async(&mut db).await? {
         Some(wallet) => wallet,

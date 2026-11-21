@@ -1,405 +1,356 @@
-//! [`Store`] provides async read and write methods of persisting BDK change sets by way of [`sqlx`].
+//! Async [`AsyncStore`] implementation backed by a dedicated worker thread.
+//!
+//! The worker owns the single SQLite connection. Callers await replies over a
+//! runtime-agnostic oneshot channel, so no particular async runtime is needed.
 
-use std::str::FromStr;
-use std::sync::Arc;
+#[cfg(feature = "wallet")]
+use std::collections::BTreeMap;
+#[cfg(feature = "wallet")]
+use std::future::Future;
+#[cfg(feature = "wallet")]
+use std::pin::Pin;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
-use bdk_chain::{
-    BlockId, ConfirmationBlockTime, DescriptorId, bitcoin, keychain_txout, local_chain, tx_graph,
-};
-use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid, consensus};
-use sqlx::{
-    Row,
-    sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool as Pool},
-};
+use bdk_chain::{ConfirmationBlockTime, keychain_txout, local_chain, tx_graph};
+#[cfg(feature = "wallet")]
+use bdk_chain::{bitcoin, miniscript};
+#[cfg(feature = "wallet")]
+use bdk_wallet::{AsyncWalletPersister, ChangeSet, KeychainKind, locked_outpoints};
+#[cfg(feature = "wallet")]
+use bitcoin::Network;
+use futures_channel::oneshot;
+#[cfg(feature = "wallet")]
+use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
+use sqlite_thin::Connection;
 
-use crate::Error;
+use crate::error::Error;
+#[cfg(feature = "wallet")]
+use crate::wallet;
+use crate::{db, migrate};
 
-/// Store.
-#[derive(Debug, Clone)]
-pub struct Store {
-    /// Pool.
-    pub(crate) pool: Pool,
+type Reply<T> = oneshot::Sender<Result<T, Error>>;
+
+enum Command {
+    Migrate(Reply<()>),
+    ReadTxGraph(Reply<tx_graph::ChangeSet<ConfirmationBlockTime>>),
+    WriteTxGraph(Box<tx_graph::ChangeSet<ConfirmationBlockTime>>, Reply<()>),
+    ReadLocalChain(Reply<local_chain::ChangeSet>),
+    WriteLocalChain(Box<local_chain::ChangeSet>, Reply<()>),
+    ReadKeychainTxout(Reply<keychain_txout::ChangeSet>),
+    WriteKeychainTxout(Box<keychain_txout::ChangeSet>, Reply<()>),
+    #[cfg(feature = "wallet")]
+    ReadChangeset(Reply<ChangeSet>),
+    #[cfg(feature = "wallet")]
+    WriteChangeset(Box<ChangeSet>, Reply<()>),
+    #[cfg(feature = "wallet")]
+    ReadNetwork(Reply<Option<Network>>),
+    #[cfg(feature = "wallet")]
+    WriteNetwork(Network, Reply<()>),
+    #[cfg(feature = "wallet")]
+    ReadKeychainDescriptors(Reply<BTreeMap<KeychainKind, Descriptor<DescriptorPublicKey>>>),
+    #[cfg(feature = "wallet")]
+    WriteKeychainDescriptors(
+        BTreeMap<KeychainKind, Descriptor<DescriptorPublicKey>>,
+        Reply<()>,
+    ),
+    #[cfg(feature = "wallet")]
+    ReadLockedOutpoints(Reply<locked_outpoints::ChangeSet>),
+    #[cfg(feature = "wallet")]
+    WriteLockedOutpoints(Box<locked_outpoints::ChangeSet>, Reply<()>),
 }
 
-impl Store {
-    /// New in memory.
-    pub async fn new_memory() -> Result<Self, Error> {
-        let mut options = sqlx::sqlite::SqlitePoolOptions::new();
-        // Don't test the health of the connection before returning it.
-        // See docs for `Pool::acquire`.
-        options = options.test_before_acquire(false);
-        let pool = options.connect("sqlite::memory:").await?;
+/// Async store.
+///
+/// Cloning is cheap: every clone shares the same worker thread and database
+/// connection. When the last clone is dropped, the worker exits.
+#[derive(Debug, Clone)]
+pub struct AsyncStore {
+    tx: Sender<Command>,
+}
 
-        Ok(Self { pool })
-    }
-
-    /// Create a new [`Store`] instance.
+impl AsyncStore {
+    /// Create a new [`AsyncStore`].
     ///
     /// This will create a new database at the given path if it doesn't exist.
-    ///
-    /// Note that `path` can be a filename, e.g. `foo.db` or a standard URL,
-    /// e.g. `sqlite://foo.db`.
+    /// See the blocking `Store::new` for the accepted path formats.
     pub async fn new(path: &str) -> Result<Self, Error> {
-        let options = SqliteConnectOptions::from_str(path)?.create_if_missing(true);
-        let pool = Pool::connect_with(options).await?;
-
-        Ok(Self { pool })
+        let conn = db::open(path)?;
+        Self::from_connection(conn)
     }
 
-    /// Create a new [`Store`] from an existing [`Pool`].
-    pub async fn new_pool(pool: Pool) -> Result<Self, Error> {
-        let store = Self { pool };
+    /// New in memory.
+    pub async fn new_memory() -> Result<Self, Error> {
+        let conn = Connection::open_in_memory()?;
+        Self::from_connection(conn)
+    }
 
-        Ok(store)
+    /// Create a new [`AsyncStore`] from an existing [`Connection`].
+    ///
+    /// The connection is moved to the worker thread.
+    pub fn from_connection(conn: Connection) -> Result<Self, Error> {
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("bdk-sqlite".to_string())
+            .spawn(move || run(conn, rx))
+            .map_err(Error::Io)?;
+        Ok(Self { tx })
     }
 
     /// Runs pending migrations against the database.
     pub async fn migrate(&self) -> Result<(), Error> {
-        Ok(sqlx::migrate!().run(&self.pool).await?)
+        self.request(Command::Migrate).await
     }
-}
 
-impl Store {
     /// Write tx_graph.
     pub async fn write_tx_graph(
-        conn: &mut SqliteConnection,
+        &self,
         tx_graph: &tx_graph::ChangeSet<ConfirmationBlockTime>,
     ) -> Result<(), Error> {
-        for tx in &tx_graph.txs {
-            let txid = tx.compute_txid();
-            sqlx::query(
-                "INSERT INTO tx(txid, tx) VALUES($1, $2) ON CONFLICT DO UPDATE SET tx = $2",
-            )
-            .bind(txid.to_string())
-            .bind(consensus::encode::serialize(tx))
-            .execute(&mut *conn)
-            .await?;
-        }
-        for (txid, t) in &tx_graph.first_seen {
-            sqlx::query("INSERT INTO tx(txid, first_seen) VALUES($1, $2) ON CONFLICT DO UPDATE SET first_seen = $2")
-                .bind(txid.to_string())
-                .bind(i64::try_from(*t)?)
-                .execute(&mut *conn)
-                .await?;
-        }
-        for (txid, t) in &tx_graph.last_seen {
-            sqlx::query("INSERT INTO tx(txid, last_seen) VALUES($1, $2) ON CONFLICT DO UPDATE SET last_seen = $2")
-                .bind(txid.to_string())
-                .bind(i64::try_from(*t)?)
-                .execute(&mut *conn)
-                .await?;
-        }
-        for (txid, t) in &tx_graph.last_evicted {
-            sqlx::query("INSERT INTO tx(txid, last_evicted) VALUES($1, $2) ON CONFLICT DO UPDATE SET last_evicted = $2")
-                .bind(txid.to_string())
-                .bind(i64::try_from(*t)?)
-                .execute(&mut *conn)
-                .await?;
-        }
-        for (op, txout) in &tx_graph.txouts {
-            let OutPoint { txid, vout } = op;
-            let TxOut {
-                value,
-                script_pubkey,
-            } = txout;
-            sqlx::query("INSERT INTO txout(txid, vout, value, script) VALUES($1, $2, $3, $4) ON CONFLICT DO UPDATE SET value = $3, script = $4")
-                .bind(txid.to_string())
-                .bind(vout)
-                .bind(i64::try_from(value.to_sat())?)
-                .bind(script_pubkey.to_bytes())
-                .execute(&mut *conn)
-                .await?;
-        }
-        for (anchor, txid) in &tx_graph.anchors {
-            let BlockId { height, hash } = anchor.block_id;
-            let confirmation_time = anchor.confirmation_time;
-            sqlx::query("INSERT OR IGNORE INTO anchor(block_height, block_hash, txid, confirmation_time) VALUES($1, $2, $3, $4)")
-                .bind(height)
-                .bind(hash.to_string())
-                .bind(txid.to_string())
-                .bind(i64::try_from(confirmation_time)?)
-                .execute(&mut *conn)
-                .await?;
-        }
-
-        Ok(())
+        self.request(|reply| Command::WriteTxGraph(Box::new(tx_graph.clone()), reply))
+            .await
     }
 
     /// Write local_chain.
     pub async fn write_local_chain(
-        conn: &mut SqliteConnection,
+        &self,
         local_chain: &local_chain::ChangeSet,
     ) -> Result<(), Error> {
-        for (&height, hash) in &local_chain.blocks {
-            match hash {
-                Some(hash) => {
-                    sqlx::query("INSERT OR IGNORE INTO block(height, hash) VALUES($1, $2)")
-                        .bind(height)
-                        .bind(hash.to_string())
-                        .execute(&mut *conn)
-                        .await?;
-                }
-                None => {
-                    sqlx::query("DELETE FROM block WHERE height = $1")
-                        .bind(height)
-                        .execute(&mut *conn)
-                        .await?;
-                }
-            }
-        }
-
-        Ok(())
+        self.request(|reply| Command::WriteLocalChain(Box::new(local_chain.clone()), reply))
+            .await
     }
 
     /// Write keychain_txout.
     pub async fn write_keychain_txout(
-        conn: &mut SqliteConnection,
+        &self,
         keychain_txout: &keychain_txout::ChangeSet,
     ) -> Result<(), Error> {
-        for (descriptor_id, last_revealed) in &keychain_txout.last_revealed {
-            sqlx::query(
-                "INSERT INTO keychain_last_revealed(descriptor_id, last_revealed) VALUES($1, $2) ON CONFLICT DO UPDATE SET last_revealed = $2",
-            )
-            .bind(descriptor_id.to_string())
-            .bind(last_revealed)
-            .execute(&mut *conn)
-            .await?;
-        }
-        for (descriptor_id, spk_cache) in &keychain_txout.spk_cache {
-            for (derivation_index, script) in spk_cache {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO keychain_script_pubkey(descriptor_id, derivation_index, script) VALUES($1, $2, $3)",
-                )
-                .bind(descriptor_id.to_string())
-                .bind(*derivation_index)
-                .bind(script.to_bytes())
-                .execute(&mut *conn)
-                .await?;
-            }
-        }
-
-        Ok(())
+        self.request(|reply| Command::WriteKeychainTxout(Box::new(keychain_txout.clone()), reply))
+            .await
     }
 
     /// Read tx_graph.
-    pub async fn read_tx_graph(
-        conn: &mut SqliteConnection,
-    ) -> Result<tx_graph::ChangeSet<ConfirmationBlockTime>, Error> {
-        let mut changeset = tx_graph::ChangeSet::default();
-
-        let rows: Vec<TxRow> =
-            sqlx::query_as("SELECT txid, tx, first_seen, last_seen, last_evicted FROM tx")
-                .fetch_all(&mut *conn)
-                .await?;
-        for row in rows {
-            let txid: Txid = row.txid.parse()?;
-            if let Some(data) = row.tx {
-                let tx: Transaction = consensus::encode::deserialize(&data)?;
-                changeset.txs.insert(Arc::new(tx));
-            }
-            if let Some(first_seen) = row.first_seen {
-                changeset.first_seen.insert(txid, first_seen.try_into()?);
-            }
-            if let Some(last_seen) = row.last_seen {
-                changeset.last_seen.insert(txid, last_seen.try_into()?);
-            }
-            if let Some(last_evicted) = row.last_evicted {
-                changeset
-                    .last_evicted
-                    .insert(txid, last_evicted.try_into()?);
-            }
-        }
-
-        let rows = sqlx::query("SELECT txid, vout, value, script FROM txout")
-            .fetch_all(&mut *conn)
-            .await?;
-        for row in rows {
-            let txid: String = row.get("txid");
-            let txid: Txid = txid.parse()?;
-            let vout: u32 = row.get("vout");
-            let value: i64 = row.get("value");
-            let value = Amount::from_sat(value.try_into()?);
-            let script: Vec<u8> = row.get("script");
-            let script_pubkey = ScriptBuf::from_bytes(script);
-            let outpoint = OutPoint { txid, vout };
-            let txout = TxOut {
-                value,
-                script_pubkey,
-            };
-            changeset.txouts.insert(outpoint, txout);
-        }
-
-        let rows =
-            sqlx::query("SELECT block_height, block_hash, txid, confirmation_time FROM anchor")
-                .fetch_all(&mut *conn)
-                .await?;
-        for row in rows {
-            let height: u32 = row.get("block_height");
-            let hash: String = row.get("block_hash");
-            let hash: BlockHash = hash.parse()?;
-            let txid: String = row.get("txid");
-            let txid: Txid = txid.parse()?;
-            let confirmation_time: i64 = row.get("confirmation_time");
-            let anchor = ConfirmationBlockTime {
-                block_id: BlockId { height, hash },
-                confirmation_time: confirmation_time.try_into()?,
-            };
-            changeset.anchors.insert((anchor, txid));
-        }
-
-        Ok(changeset)
+    pub async fn read_tx_graph(&self) -> Result<tx_graph::ChangeSet<ConfirmationBlockTime>, Error> {
+        self.request(Command::ReadTxGraph).await
     }
 
     /// Read local_chain.
-    pub async fn read_local_chain(
-        conn: &mut SqliteConnection,
-    ) -> Result<local_chain::ChangeSet, Error> {
-        let mut changeset = local_chain::ChangeSet::default();
-
-        let rows = sqlx::query("SELECT height, hash FROM block")
-            .fetch_all(&mut *conn)
-            .await?;
-        for row in rows {
-            let height: u32 = row.get("height");
-            let hash: String = row.get("hash");
-            let hash: BlockHash = hash.parse()?;
-            changeset.blocks.insert(height, Some(hash));
-        }
-
-        Ok(changeset)
+    pub async fn read_local_chain(&self) -> Result<local_chain::ChangeSet, Error> {
+        self.request(Command::ReadLocalChain).await
     }
 
     /// Read keychain_txout.
-    pub async fn read_keychain_txout(
-        conn: &mut SqliteConnection,
-    ) -> Result<keychain_txout::ChangeSet, Error> {
-        let mut changeset = keychain_txout::ChangeSet::default();
+    pub async fn read_keychain_txout(&self) -> Result<keychain_txout::ChangeSet, Error> {
+        self.request(Command::ReadKeychainTxout).await
+    }
 
-        let rows = sqlx::query("SELECT descriptor_id, last_revealed FROM keychain_last_revealed")
-            .fetch_all(&mut *conn)
-            .await?;
-        for row in rows {
-            let descriptor_id: String = row.get("descriptor_id");
-            let descriptor_id: DescriptorId = descriptor_id.parse()?;
-            let last_revealed: u32 = row.get("last_revealed");
-            changeset.last_revealed.insert(descriptor_id, last_revealed);
-        }
+    #[cfg(feature = "wallet")]
+    /// Write changeset.
+    pub async fn write_changeset(&self, changeset: &ChangeSet) -> Result<(), Error> {
+        self.request(|reply| Command::WriteChangeset(Box::new(changeset.clone()), reply))
+            .await
+    }
 
-        let rows = sqlx::query(
-            "SELECT descriptor_id, derivation_index, script FROM keychain_script_pubkey",
-        )
-        .fetch_all(&mut *conn)
-        .await?;
+    #[cfg(feature = "wallet")]
+    /// Write network.
+    pub async fn write_network(&self, network: Network) -> Result<(), Error> {
+        self.request(|reply| Command::WriteNetwork(network, reply))
+            .await
+    }
 
-        for row in rows {
-            let descriptor_id: String = row.get("descriptor_id");
-            let descriptor_id: DescriptorId = descriptor_id.parse()?;
-            let derivation_index: u32 = row.get("derivation_index");
-            let script: Vec<u8> = row.get("script");
-            let script = ScriptBuf::from_bytes(script);
-            changeset
-                .spk_cache
-                .entry(descriptor_id)
-                .or_default()
-                .insert(derivation_index, script);
-        }
+    #[cfg(feature = "wallet")]
+    /// Write keychain descriptors.
+    pub async fn write_keychain_descriptors(
+        &self,
+        descriptors: &BTreeMap<KeychainKind, Descriptor<DescriptorPublicKey>>,
+    ) -> Result<(), Error> {
+        self.request(|reply| Command::WriteKeychainDescriptors(descriptors.clone(), reply))
+            .await
+    }
 
-        Ok(changeset)
+    #[cfg(feature = "wallet")]
+    /// Read changeset.
+    pub async fn read_changeset(&self) -> Result<ChangeSet, Error> {
+        self.request(Command::ReadChangeset).await
+    }
+
+    #[cfg(feature = "wallet")]
+    /// Read network.
+    pub async fn read_network(&self) -> Result<Option<Network>, Error> {
+        self.request(Command::ReadNetwork).await
+    }
+
+    #[cfg(feature = "wallet")]
+    /// Read keychain descriptors.
+    pub async fn read_keychain_descriptors(
+        &self,
+    ) -> Result<BTreeMap<KeychainKind, Descriptor<DescriptorPublicKey>>, Error> {
+        self.request(Command::ReadKeychainDescriptors).await
+    }
+
+    #[cfg(feature = "wallet")]
+    /// Write locked outpoints.
+    pub async fn write_locked_outpoints(
+        &self,
+        locked_outpoints: &locked_outpoints::ChangeSet,
+    ) -> Result<(), Error> {
+        self.request(|reply| {
+            Command::WriteLockedOutpoints(Box::new(locked_outpoints.clone()), reply)
+        })
+        .await
+    }
+
+    #[cfg(feature = "wallet")]
+    /// Read locked outpoints.
+    pub async fn read_locked_outpoints(&self) -> Result<locked_outpoints::ChangeSet, Error> {
+        self.request(Command::ReadLockedOutpoints).await
+    }
+
+    async fn request<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, Error>>) -> Command,
+    ) -> Result<T, Error> {
+        let (reply, response) = oneshot::channel();
+        self.tx.send(make(reply)).map_err(|_| Error::WorkerGone)?;
+        response.await.map_err(|_| Error::WorkerGone)?
     }
 }
 
-/// Represents a row in the tx table.
-#[derive(Debug, sqlx::FromRow)]
-struct TxRow {
-    /// Txid
-    txid: String,
-    /// Raw transaction
-    tx: Option<Vec<u8>>,
-    /// First seen
-    first_seen: Option<i64>,
-    /// Last seen
-    last_seen: Option<i64>,
-    /// Last evicted
-    last_evicted: Option<i64>,
+fn run(conn: Connection, rx: Receiver<Command>) {
+    while let Ok(command) = rx.recv() {
+        match command {
+            Command::Migrate(reply) => {
+                let _ = reply.send(migrate::migrate(&conn));
+            }
+            Command::ReadTxGraph(reply) => {
+                let _ = reply.send(db::read_tx_graph(&conn));
+            }
+            Command::WriteTxGraph(changeset, reply) => {
+                let _ = reply.send(db::write_tx_graph(&conn, &changeset));
+            }
+            Command::ReadLocalChain(reply) => {
+                let _ = reply.send(db::read_local_chain(&conn));
+            }
+            Command::WriteLocalChain(changeset, reply) => {
+                let _ = reply.send(db::write_local_chain(&conn, &changeset));
+            }
+            Command::ReadKeychainTxout(reply) => {
+                let _ = reply.send(db::read_keychain_txout(&conn));
+            }
+            Command::WriteKeychainTxout(changeset, reply) => {
+                let _ = reply.send(db::write_keychain_txout(&conn, &changeset));
+            }
+            #[cfg(feature = "wallet")]
+            Command::ReadChangeset(reply) => {
+                let _ = reply.send(wallet::read_changeset(&conn));
+            }
+            #[cfg(feature = "wallet")]
+            Command::WriteChangeset(changeset, reply) => {
+                let _ = reply.send(wallet::write_changeset(&conn, &changeset));
+            }
+            #[cfg(feature = "wallet")]
+            Command::ReadNetwork(reply) => {
+                let _ = reply.send(wallet::read_network(&conn));
+            }
+            #[cfg(feature = "wallet")]
+            Command::WriteNetwork(network, reply) => {
+                let _ = reply.send(wallet::write_network(&conn, network));
+            }
+            #[cfg(feature = "wallet")]
+            Command::ReadKeychainDescriptors(reply) => {
+                let _ = reply.send(wallet::read_keychain_descriptors(&conn));
+            }
+            #[cfg(feature = "wallet")]
+            Command::WriteKeychainDescriptors(descriptors, reply) => {
+                let _ = reply.send(wallet::write_keychain_descriptors(&conn, &descriptors));
+            }
+            #[cfg(feature = "wallet")]
+            Command::ReadLockedOutpoints(reply) => {
+                let _ = reply.send(wallet::read_locked_outpoints(&conn));
+            }
+            #[cfg(feature = "wallet")]
+            Command::WriteLockedOutpoints(locked_outpoints, reply) => {
+                let _ = reply.send(wallet::write_locked_outpoints(&conn, &locked_outpoints));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "wallet")]
+type FutureResult<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + 'a + Send>>;
+
+#[cfg(feature = "wallet")]
+impl AsyncWalletPersister for AsyncStore {
+    type Error = crate::Error;
+
+    fn initialize<'a>(persister: &'a mut Self) -> FutureResult<'a, ChangeSet, Self::Error>
+    where
+        Self: 'a,
+    {
+        Box::pin(async {
+            persister.migrate().await?;
+            persister.read_changeset().await
+        })
+    }
+
+    fn persist<'a>(
+        persister: &'a mut Self,
+        changeset: &'a ChangeSet,
+    ) -> FutureResult<'a, (), Self::Error>
+    where
+        Self: 'a,
+    {
+        Box::pin(async { persister.write_changeset(changeset).await })
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
 
+    use bdk_chain::local_chain;
     use bitcoin::hashes::Hash;
 
     #[tokio::test]
-    async fn block_table_height_is_unique() -> anyhow::Result<()> {
-        let mut cs = local_chain::ChangeSet::default();
-        cs.blocks.insert(0, Some(Hash::hash(b"0")));
-        cs.blocks.insert(1, Some(Hash::hash(b"1")));
-
-        let store = Store::new_memory().await?;
+    async fn local_chain_round_trip() -> anyhow::Result<()> {
+        let store = AsyncStore::new_memory().await?;
         store.migrate().await?;
 
-        {
-            let mut txn = store.pool.begin().await?;
-            Store::write_local_chain(&mut txn, &cs)
-                .await
-                .expect("failed to write `local_chain`");
-            txn.commit().await?;
-        }
-
-        // Trying to replace the value of existing height should be ignored.
-        cs.blocks.insert(1, Some(Hash::hash(b"1a")));
-
-        {
-            let mut txn = store.pool.begin().await?;
-            Store::write_local_chain(&mut txn, &cs)
-                .await
-                .expect("failed to write `local_chain`");
-            txn.commit().await?;
-        }
-
-        let rows = sqlx::query("SELECT height, hash FROM block WHERE height = 1")
-            .fetch_all(&store.pool)
-            .await?;
-
-        assert_eq!(rows.len(), 1, "Expected 1 block row");
-
-        let row = rows.first().unwrap();
-        let row_hash: String = row.get("hash");
-        let expected_hash: BlockHash = Hash::hash(b"1");
-        assert_eq!(row_hash, expected_hash.to_string());
-
-        // Delete row 1 and insert hash "1a" again.
         let mut cs = local_chain::ChangeSet::default();
-        cs.blocks.insert(1, None);
+        cs.blocks.insert(0, Some(Hash::hash(b"0")));
 
-        {
-            let mut txn = store.pool.begin().await?;
-            Store::write_local_chain(&mut txn, &cs)
-                .await
-                .expect("failed to write `local_chain`");
-            txn.commit().await?;
-        }
+        store.write_local_chain(&cs).await?;
+        let read = store.read_local_chain().await?;
+        assert_eq!(read, cs);
 
-        cs.blocks.insert(1, Some(Hash::hash(b"1a")));
+        Ok(())
+    }
 
-        {
-            let mut txn = store.pool.begin().await?;
-            Store::write_local_chain(&mut txn, &cs)
-                .await
-                .expect("failed to write `local_chain`");
-            txn.commit().await?;
-        }
+    #[cfg(feature = "wallet")]
+    #[tokio::test]
+    async fn wallet_changeset_round_trip() -> anyhow::Result<()> {
+        use bitcoin::{OutPoint, Txid};
 
-        let rows = sqlx::query("SELECT height, hash FROM block WHERE height = 1")
-            .fetch_all(&store.pool)
-            .await?;
+        let store = AsyncStore::new_memory().await?;
+        store.migrate().await?;
 
-        // Row hash should change to "1a".
-        assert_eq!(rows.len(), 1, "Expected 1 block row");
-        let row = rows.first().unwrap();
-        let row_hash: String = row.get("hash");
-        let expected_hash: BlockHash = Hash::hash(b"1a");
-        assert_eq!(row_hash, expected_hash.to_string());
+        let mut cs = ChangeSet {
+            network: Some(Network::Bitcoin),
+            ..Default::default()
+        };
+        cs.locked_outpoints.outpoints.insert(
+            OutPoint {
+                txid: Txid::all_zeros(),
+                vout: 0,
+            },
+            true,
+        );
+
+        store.write_changeset(&cs).await?;
+        let read = store.read_changeset().await?;
+
+        assert_eq!(read.network, Some(Network::Bitcoin));
+        assert_eq!(read.locked_outpoints, cs.locked_outpoints);
 
         Ok(())
     }
