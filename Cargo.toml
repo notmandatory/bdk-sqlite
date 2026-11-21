@@ -43,8 +43,8 @@ bundled = ["sqlite-thin/bundled"]
 
 [[example]]
 name = "wallet"
-required-features = ["async", "wallet"]
+required-features = ["blocking", "wallet"]
 
 [[example]]
-name = "wallet_blocking"
-required-features = ["blocking", "wallet"]
+name = "wallet_async"
+required-features = ["async", "wallet"]
