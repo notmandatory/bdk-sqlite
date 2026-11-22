@@ -24,6 +24,8 @@ sqlite-thin = { git = "https://github.com/thesimplekid/cdk", rev = "50b2688b0c0b
 [dev-dependencies]
 anyhow = "1"
 bdk_esplora = { version = "0.22.2", features = ["tokio"] }
+bdk_wallet = { version = "3.2.0", features = ["test-utils"] }
+tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["full"] }
 
 [dev-dependencies.bdk_sqlite]
