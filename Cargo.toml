@@ -19,7 +19,7 @@ sha2 = { version = "0.10", optional = true }
 # `sqlite-thin` is unpublished. The crate lives in the `crates/sqlite-thin`
 # member of the CDK workspace, so pin a revision and select it by package name.
 # TODO: switch to a crates.io release once one exists.
-sqlite-thin = { git = "https://github.com/thesimplekid/cdk", rev = "50b2688b0c0b78e55538935a795f83ad1f26c58a" }
+sqlite-thin = { git = "https://git.rust-bitcoin.org/thesimplekid/sqlite-thin.git" }
 
 [dev-dependencies]
 anyhow = "1"
